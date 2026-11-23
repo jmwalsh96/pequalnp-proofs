@@ -1,350 +1,770 @@
-import Mathlib.Algebra.Order.BigOperators.Group.Finset
-import Mathlib.Data.List.GetD
-import Mathlib.Order.Interval.Finset.Nat
+import Mathlib
 import PEqualNP.Defs
-
--- Original proof by k-sandhu in PR 149.
--- Adapted here to the current proof-file namespace rules.
-
-open PEqualNP.CircuitLowerBounds
 
 namespace PEqualNP.Outside.L_meta_925
 
-private def run (gs : List Gate) (x : List Bool) : List Bool :=
-  gs.foldl (fun w g => w ++ [g.op.eval (g.inputs.map fun i => w.getD i false)]) x
+open PEqualNP.CircuitLowerBounds
 
-private lemma run_cons (g : Gate) (gs : List Gate) (x : List Bool) :
-    run (g :: gs) x = run gs (x ++ [g.op.eval (g.inputs.map fun i => x.getD i false)]) :=
-  rfl
+def stepWires (w : List Bool) (g : Gate) : List Bool :=
+  w ++ [g.op.eval (g.inputs.map fun i => w.getD i false)]
 
-private lemma run_length (gs : List Gate) (x : List Bool) :
-    (run gs x).length = x.length + gs.length := by
-  induction gs generalizing x with
-  | nil => simp [run]
-  | cons g gs ih => rw [run_cons, ih]; simp; omega
+lemma stepWires_length (w : List Bool) (g : Gate) :
+    (stepWires w g).length = w.length + 1 := by
+  simp [stepWires]
 
-private lemma run_getD (gs : List Gate) (x : List Bool) (w : ℕ) (hw : w < x.length) :
-    (run gs x).getD w false = x.getD w false := by
-  induction gs generalizing x with
+lemma foldl_stepWires_length (gs : List Gate) (w : List Bool) :
+    (gs.foldl stepWires w).length = w.length + gs.length := by
+  induction gs generalizing w with
+  | nil => simp
+  | cons g gs ih =>
+    simp [List.foldl_cons, ih, stepWires_length]
+    omega
+
+lemma getD_append_lt (w₁ w₂ : List Bool) {i : ℕ} (hi : i < w₁.length) :
+    (w₁ ++ w₂).getD i false = w₁.getD i false := by
+  simp [List.getD_eq_getElem?_getD, List.getElem?_append_left hi]
+
+lemma foldl_stepWires_getD_lt (gs : List Gate) (w : List Bool) {u : ℕ} (hu : u < w.length) :
+    (gs.foldl stepWires w).getD u false = w.getD u false := by
+  induction gs generalizing w with
   | nil => rfl
   | cons g gs ih =>
-    rw [run_cons, ih _ (by simp; omega), List.getD_append _ _ _ _ hw]
+    rw [List.foldl_cons, ih (stepWires w g) (by rw [stepWires_length]; omega)]
+    exact getD_append_lt w _ hu
 
-private lemma run_split (gs : List Gate) (x : List Bool) (j : ℕ) :
-    run gs x = run (gs.drop j) (run (gs.take j) x) := by
-  simpa only [run, List.foldl_append] using
-    congrArg (fun l : List Gate => run l x) (List.take_append_drop j gs).symm
+lemma getD_eq_false_of_le (w : List Bool) {u : ℕ} (hu : w.length ≤ u) :
+    w.getD u false = false := by
+  simp [List.getD_eq_getElem?_getD, List.getElem?_eq_none hu]
 
-private def value {n : ℕ} (C : Circuit) (x : Fin n → Bool) (w : ℕ) : Bool :=
-  (C.wires (List.ofFn x)).getD w false
+def wireAt (gs : List Gate) (n : ℕ) (x : Fin n → Bool) (u : ℕ) : Bool :=
+  (gs.foldl stepWires (List.ofFn x)).getD u false
 
-private lemma input_value {n : ℕ} (C : Circuit) (x : Fin n → Bool) (p : Fin n) :
-    value C x p = x p := by
-  change (run C.gates (List.ofFn x)).getD p false = x p
-  have hp : (p : ℕ) < (List.ofFn x).length := by simp
-  rw [run_getD _ _ _ hp, List.getD_eq_getElem _ _ hp]
-  simp
+lemma wireAt_eq_eval (gs : List Gate) (n : ℕ) (x : Fin n → Bool) (u : ℕ) :
+    Circuit.eval ⟨gs, u⟩ (List.ofFn x) = wireAt gs n x u :=
+  rfl
 
-private lemma missing_value {n : ℕ} (C : Circuit) (x : Fin n → Bool) (w : ℕ)
-    (hw : n + C.size ≤ w) : value C x w = false := by
-  change (run C.gates (List.ofFn x)).getD w false = false
-  exact List.getD_eq_default _ _ (by simpa [run_length, Circuit.size] using hw)
+lemma wireAt_lt_length (gs : List Gate) (n : ℕ) (x : Fin n → Bool) {u : ℕ}
+    (hu : wireAt gs n x u = true) : u < n + gs.length := by
+  by_contra h
+  have hle : (gs.foldl stepWires (List.ofFn x)).length ≤ u := by
+    rw [foldl_stepWires_length, List.length_ofFn]
+    omega
+  have hf : wireAt gs n x u = false := getD_eq_false_of_le _ hle
+  rw [hf] at hu
+  exact Bool.false_ne_true hu
 
--- At a gate, reads of earlier wires agree with the completed run.
--- All other reads contribute false, even if the wire is produced later.
-private lemma gate_value {n : ℕ} (C : Circuit) (x : Fin n → Bool) (w : ℕ)
-    (hn : n ≤ w) (hw : w < n + C.size) :
-    let g := C.gates[w - n]'(by unfold Circuit.size at hw; omega)
-    value C x w = g.op.eval (g.inputs.map fun r => if r < w then value C x r else false) := by
-  let j := w - n
-  have hj : j < C.gates.length := by unfold j Circuit.size at *; omega
-  let g := C.gates[j]
-  let earlier := run (C.gates.take j) (List.ofFn x)
-  have plen : earlier.length = w := by
-    simp [earlier, run_length, Nat.min_eq_left hj.le, j]; omega
-  have split : run C.gates (List.ofFn x) = run (g :: C.gates.drop (j + 1)) earlier := by
-    rw [run_split C.gates (List.ofFn x) j, List.drop_eq_getElem_cons hj]
-  have read (r : ℕ) : earlier.getD r false = if r < w then value C x r else false := by
-    by_cases hr : r < w
-    · rw [ite_eq_left hr]
-      change earlier.getD r false = (run C.gates (List.ofFn x)).getD r false
-      rw [split]
-      exact (run_getD _ earlier r (by simpa only [plen] using hr)).symm
-    · rw [ite_eq_right hr]
-      exact List.getD_eq_default _ _ (by omega)
-  change (run C.gates (List.ofFn x)).getD w false =
-    g.op.eval (g.inputs.map fun r => if r < w then value C x r else false)
-  rw (occs := [1]) [split]
-  rw (occs := [1]) [run_cons]
-  rw [run_getD _ _ _ (by simp [plen]), List.getD_append_right _ _ _ _ (by omega)]
-  simp only [plen, Nat.sub_self, List.getD_cons_zero, read]
+lemma wireAt_input (gs : List Gate) (n : ℕ) (x : Fin n → Bool) {u : ℕ} (hu : u < n) :
+    wireAt gs n x u = x ⟨u, hu⟩ := by
+  unfold wireAt
+  rw [foldl_stepWires_getD_lt gs (List.ofFn x) (by simpa using hu)]
+  simp [List.getD_eq_getElem?_getD, hu]
 
-private lemma gate_inputs {n : ℕ} (C : Circuit)
-    (hG : ∀ g ∈ C.gates, (g.op = GateOp.and ∨ g.op = GateOp.or) ∧ g.inputs.length ≤ 2)
-    (w : ℕ) (hn : n ≤ w) (hw : w < n + C.size) :
-    ∃ P : Finset ℕ, P.card ≤ 2 ∧ (∀ r ∈ P, r < w) ∧
-      ∀ (x y : Fin n → Bool), (∀ r ∈ P, value C x r = true → value C y r = true) →
-        value C x w = true → value C y w = true := by
-  let g := C.gates[w - n]'(by unfold Circuit.size at hw; omega)
-  obtain ⟨hop, hlen⟩ := hG g (List.getElem_mem _)
-  let P := g.inputs.toFinset.filter (· < w)
-  refine ⟨P, (Finset.card_filter_le _ _).trans ((List.toFinset_card_le g.inputs).trans hlen), ?_, ?_⟩
-  · intro r hr
-    exact (Finset.mem_filter.mp hr).2
-  · intro x y hxy hx
-    have hr (r : ℕ) (hm : r ∈ g.inputs) :
-        (if r < w then value C x r else false) = true →
-        (if r < w then value C y r else false) = true := by
-      by_cases h : r < w
-      · simpa [h] using hxy r (Finset.mem_filter.mpr ⟨List.mem_toFinset.mpr hm, h⟩)
-      · simp [h]
-    rw [gate_value C x w hn hw] at hx
-    rw [gate_value C y w hn hw]
-    change g.op.eval _ = true at hx ⊢
-    rcases hop with hop | hop
-    · simp only [hop, GateOp.eval, List.all_eq_true, id_eq] at hx ⊢
-      intro b hb
-      obtain ⟨r, hm, rfl⟩ := List.mem_map.mp hb
-      exact hr r hm (hx _ (List.mem_map.mpr ⟨r, hm, rfl⟩))
-    · simp only [hop, GateOp.eval, List.any_eq_true, id_eq] at hx ⊢
-      obtain ⟨b, hb, rfl⟩ := hx
-      obtain ⟨r, hm, hv⟩ := List.mem_map.mp hb
-      exact ⟨_, List.mem_map.mpr ⟨r, hm, rfl⟩, hr r hm hv⟩
+lemma foldl_stepWires_getD_add (gs : List Gate) (w : List Bool) {j : ℕ} (hj : j < gs.length) :
+    (gs.foldl stepWires w).getD (w.length + j) false =
+      gs[j].op.eval (gs[j].inputs.map fun a =>
+        if a < w.length + j then (gs.foldl stepWires w).getD a false else false) := by
+  induction gs generalizing w j with
+  | nil => simp at hj
+  | cons g gs ih =>
+    cases j with
+    | zero =>
+      simp only [Nat.add_zero, List.getElem_cons_zero, List.foldl_cons]
+      rw [foldl_stepWires_getD_lt gs (stepWires w g) (by rw [stepWires_length]; omega)]
+      have hget : (stepWires w g).getD w.length false =
+          g.op.eval (g.inputs.map fun i => w.getD i false) := by
+        simp [stepWires, List.getD_eq_getElem?_getD]
+      rw [hget]
+      congr 1
+      apply List.map_congr_left
+      intro a _
+      by_cases ha : a < w.length
+      · simp only [ha, ↓reduceIte]
+        rw [foldl_stepWires_getD_lt gs (stepWires w g) (by rw [stepWires_length]; omega)]
+        exact (getD_append_lt w _ ha).symm
+      · simp only [ha, ↓reduceIte]
+        exact getD_eq_false_of_le w (Nat.le_of_not_lt ha)
+    | succ k =>
+      simp only [List.foldl_cons, List.getElem_cons_succ]
+      have hk : k < gs.length := by simpa using hj
+      have hlen : (stepWires w g).length = w.length + 1 := stepWires_length w g
+      have heq : w.length + (k + 1) = (stepWires w g).length + k := by omega
+      rw [heq]
+      exact ih (stepWires w g) hk
 
-private lemma value_mono {n : ℕ} (C : Circuit)
-    (hG : ∀ g ∈ C.gates, (g.op = GateOp.and ∨ g.op = GateOp.or) ∧ g.inputs.length ≤ 2)
-    (x y : Fin n → Bool) (hxy : ∀ p, x p = true → y p = true) (w : ℕ) :
-    value C x w = true → value C y w = true := by
-  induction w using Nat.strong_induction_on with
-  | ind w ih =>
-    by_cases hn : w < n
-    · let p : Fin n := ⟨w, hn⟩
-      change value C x p = true → value C y p = true
-      simpa only [input_value] using hxy p
-    by_cases hw : w < n + C.size
-    · obtain ⟨P, _, hP, hstep⟩ := gate_inputs C hG w (by omega) hw
-      exact hstep x y fun r hr => ih r (hP r hr)
-    · simp [missing_value C x w (by omega)]
+lemma wireAt_gate (gs : List Gate) (n : ℕ) (x : Fin n → Bool) {j : ℕ} (hj : j < gs.length) :
+    wireAt gs n x (n + j) =
+      gs[j].op.eval (gs[j].inputs.map fun a =>
+        if a < n + j then wireAt gs n x a else false) := by
+  unfold wireAt
+  have h := foldl_stepWires_getD_add gs (List.ofFn x) hj
+  simpa [List.length_ofFn] using h
 
--- Expand the selected gates once each, in reverse evaluation order.
--- Replacing one wire by at most two earlier wires increases the cut by at most one.
-private lemma cut {n : ℕ} (C : Circuit)
-    (hG : ∀ g ∈ C.gates, (g.op = GateOp.and ∨ g.op = GateOp.or) ∧ g.inputs.length ≤ 2)
-    (G : Finset ℕ) (hGates : ∀ w ∈ G, n ≤ w ∧ w < n + C.size)
-    (t : ℕ) (F : Finset ℕ) (hF : ∀ w ∈ F, w ∈ G → w < t) :
-    ∃ B : Finset ℕ, Disjoint B G ∧ B.card ≤ F.card + (G.filter (· < t)).card ∧
-      ∀ x y : Fin n → Bool, (∀ w ∈ B, value C x w = true → value C y w = true) →
-        ∀ w ∈ F, value C x w = true → value C y w = true := by
-  induction t generalizing F with
-  | zero =>
-    exact ⟨F, Finset.disjoint_left.mpr (fun w hw hg => by have := hF w hw hg; omega),
-      Nat.le_add_right .., fun _ _ h => h⟩
-  | succ t ih =>
-    by_cases hex : t ∈ F ∧ t ∈ G
-    · obtain ⟨P, hPcard, hP, hp⟩ := gate_inputs C hG t (hGates t hex.2).1 (hGates t hex.2).2
-      let F' := F.erase t ∪ P
-      have hF' : ∀ w ∈ F', w ∈ G → w < t := by
-        intro w hw hg
-        rcases Finset.mem_union.mp hw with hw | hw
-        · have hne := (Finset.mem_erase.mp hw).1
-          have hlt := hF w (Finset.mem_erase.mp hw).2 hg
-          omega
-        · exact hP w hw
-      obtain ⟨B, hd, hc, hi⟩ := ih F' hF'
-      have hsize : F'.card ≤ F.card + 1 := by
-        have hu := Finset.card_union_le (F.erase t) P
-        have he := Finset.card_erase_add_one hex.1
-        change F'.card ≤ _ at hu
-        omega
-      have hfilter : G.filter (· < t + 1) = insert t (G.filter (· < t)) := by
-        ext w
-        simp only [Finset.mem_filter, Finset.mem_insert]
-        constructor
-        · rintro ⟨hg, hlt⟩
-          by_cases h : w = t
-          · exact Or.inl h
-          · exact Or.inr ⟨hg, by omega⟩
-        · rintro (rfl | ⟨hg, hlt⟩)
-          · exact ⟨hex.2, by omega⟩
-          · exact ⟨hg, by omega⟩
-      refine ⟨B, hd, ?_, ?_⟩
-      · rw [hfilter, Finset.card_insert_of_notMem (by simp)]
-        omega
-      · intro x y hxy w hw
-        by_cases h : w = t
-        · subst w
-          exact hp x y fun r hr => hi x y hxy r (Finset.mem_union_right _ hr)
-        · exact hi x y hxy w (Finset.mem_union_left _ (Finset.mem_erase.mpr ⟨h, hw⟩))
-    · have hF' : ∀ w ∈ F, w ∈ G → w < t := by
-        intro w hw hg
-        have hne : w ≠ t := fun e => hex ⟨e ▸ hw, e ▸ hg⟩
-        have hlt := hF w hw hg
-        omega
-      obtain ⟨B, hd, hc, hi⟩ := ih F hF'
-      have hle : (G.filter (· < t)).card ≤ (G.filter (· < t + 1)).card :=
-        Finset.card_le_card fun w hw =>
-          Finset.mem_filter.mpr ⟨(Finset.mem_filter.mp hw).1, by have := (Finset.mem_filter.mp hw).2; omega⟩
-      exact ⟨B, hd, by omega, hi⟩
+lemma foldl_stepWires_mono (gs : List Gate)
+    (hgs : ∀ g ∈ gs, g.op = GateOp.and ∨ g.op = GateOp.or)
+    (w₁ w₂ : List Bool) (hlen : w₁.length = w₂.length)
+    (hle : ∀ i, w₁.getD i false = true → w₂.getD i false = true) :
+    ∀ i, (gs.foldl stepWires w₁).getD i false = true →
+      (gs.foldl stepWires w₂).getD i false = true := by
+  induction gs generalizing w₁ w₂ with
+  | nil => exact hle
+  | cons g gs ih =>
+    intro i hi
+    simp only [List.foldl_cons] at hi ⊢
+    have hg : g.op = GateOp.and ∨ g.op = GateOp.or := hgs g (List.mem_cons_self ..)
+    have hgs' : ∀ g' ∈ gs, g'.op = GateOp.and ∨ g'.op = GateOp.or :=
+      fun g' hg' => hgs g' (List.mem_cons_of_mem g hg')
+    have hstep : g.op.eval (g.inputs.map fun k => w₁.getD k false) = true →
+        g.op.eval (g.inputs.map fun k => w₂.getD k false) = true := by
+      rcases hg with hop | hop
+      · rw [hop]
+        simp only [GateOp.eval, List.all_eq_true, List.mem_map, id_eq, forall_exists_index,
+          and_imp, forall_apply_eq_imp_iff₂]
+        intro h k hk
+        exact hle k (h k hk)
+      · rw [hop]
+        simp only [GateOp.eval, List.any_eq_true, List.mem_map, id_eq, exists_exists_and_eq_and]
+        rintro ⟨k, hk, hkw⟩
+        exact ⟨k, hk, hle k hkw⟩
+    refine ih hgs' (stepWires w₁ g) (stepWires w₂ g) ?_ ?_ i hi
+    · simp [stepWires_length, hlen]
+    · intro k hk
+      by_cases hlt : k < w₁.length
+      · unfold stepWires at hk ⊢
+        rw [getD_append_lt w₁ _ hlt] at hk
+        rw [getD_append_lt w₂ _ (hlen ▸ hlt)]
+        exact hle k hk
+      · by_cases heq : k = w₁.length
+        · subst heq
+          simp only [stepWires, List.getD_eq_getElem?_getD] at hk ⊢
+          rw [List.getElem?_concat_length] at hk
+          rw [hlen, List.getElem?_concat_length]
+          simp only [Option.getD_some] at hk ⊢
+          exact hstep (by simpa [List.getD_eq_getElem?_getD] using hk)
+        · have hge : (stepWires w₁ g).length ≤ k := by
+            rw [stepWires_length]
+            omega
+          rw [getD_eq_false_of_le _ hge] at hk
+          exact False.elim (Bool.false_ne_true hk)
 
+lemma wireAt_mono (gs : List Gate)
+    (hgs : ∀ g ∈ gs, g.op = GateOp.and ∨ g.op = GateOp.or)
+    (n : ℕ) (x y : Fin n → Bool) (hxy : ∀ i : Fin n, x i = true → y i = true)
+    (u : ℕ) (hu : wireAt gs n x u = true) :
+    wireAt gs n y u = true := by
+  refine foldl_stepWires_mono gs hgs (List.ofFn x) (List.ofFn y) (by simp) ?_ u hu
+  intro i hi
+  by_cases hlt : i < n
+  · simp only [List.getD_eq_getElem?_getD, List.getElem?_ofFn, hlt, dite_true,
+      Option.getD_some] at hi ⊢
+    exact hxy ⟨i, hlt⟩ hi
+  · have hge : (List.ofFn x).length ≤ i := by simpa using Nat.le_of_not_lt hlt
+    rw [getD_eq_false_of_le _ hge] at hi
+    exact False.elim (Bool.false_ne_true hi)
 
-private def onSet {n : ℕ} (T : Finset (Fin n)) (p : Fin n) : Bool := decide (p ∈ T)
+def ind {n : ℕ} (T : Finset (Fin n)) : Fin n → Bool :=
+  fun i => decide (i ∈ T)
 
-private lemma weight {n : ℕ} (T : Finset (Fin n)) :
-    (Finset.univ.filter (fun p => onSet T p = true)).card = T.card := by
-  congr 1
-  ext p
-  simp [onSet]
+lemma weight_ind {n : ℕ} (T : Finset (Fin n)) :
+    (Finset.univ.filter (fun i : Fin n => ind T i = true)).card = T.card := by
+  have h : Finset.univ.filter (fun i : Fin n => ind T i = true) = T := by
+    ext i
+    simp [ind]
+  rw [h]
 
-private lemma union_bound {q n m : ℕ} (S : Fin m → Finset (Fin n))
-    (hsize : ∀ i, (S i).card = q + 1)
-    (hinter : ∀ i j, i ≠ j → (S i ∩ S j).card = 1)
-    (B : Finset ℕ) (A : ℕ → Finset (Fin n))
-    (hA : ∀ w ∈ B, (A w).card ≤ q ∨ ∃ i, A w = S i) :
-    (B.biUnion A).card ≤ B.card * q + 1 := by
-  classical
-  by_cases hbig : ∃ w ∈ B, ∃ i, A w = S i
-  · obtain ⟨w,hw,i,hi⟩ := hbig
-    let R := B.erase w
-    have hdiff : ∀ v ∈ R, (A v \ S i).card ≤ q := by
+def spec (gates : List Gate) {n m : ℕ} (S : Fin m → Finset (Fin n)) (w : Fin m) :
+    Finset (Fin gates.length) :=
+  Finset.univ.filter fun j =>
+    wireAt gates n (ind (S w)) (n + j.1) = true ∧
+      ∀ v : Fin m, v ≠ w → wireAt gates n (ind (S v)) (n + j.1) = false
+
+lemma spec_disjoint (gates : List Gate) {n m : ℕ} (S : Fin m → Finset (Fin n))
+    {w₁ w₂ : Fin m} (hw : w₁ ≠ w₂) :
+    Disjoint (spec gates S w₁) (spec gates S w₂) := by
+  rw [Finset.disjoint_left]
+  intro j hj₁ hj₂
+  simp only [spec, Finset.mem_filter, Finset.mem_univ, true_and] at hj₁ hj₂
+  have ht := hj₁.1
+  have hf := hj₂.2 w₁ hw
+  rw [ht] at hf
+  exact Bool.false_ne_true hf.symm
+
+def GoodState (n K q : ℕ) {m : ℕ} (S : Fin m → Finset (Fin n)) (gates : List Gate)
+    (w : Fin m) (B : ℕ) (F : Finset ℕ) (P : Finset (Fin n))
+    (A : Finset (Fin gates.length)) (d : ℕ) : Prop :=
+  (∀ u ∈ F, u < B) ∧
+  (∀ u ∈ F, wireAt gates n (ind (S w)) u = true) ∧
+  (∀ x : Fin n → Bool,
+    (Finset.univ.filter (fun i : Fin n => x i = true)).card ≤ K →
+    (∀ p ∈ P, x p = true) →
+    (∃ v ∈ S w, x v = false) →
+    ∃ u ∈ F, wireAt gates n x u = false) ∧
+  A ⊆ spec gates S w ∧
+  F.card + d ≤ 1 + A.card ∧
+  (∀ u ∈ F, ∀ j ∈ A, u < n + j.1) ∧
+  (P ∩ S w).card ≤ d ∧
+  (P.card ≤ d ∨ (P.card ≤ d * q + 1 ∧ ∃ v₀ : Fin m, S v₀ ⊆ P))
+
+lemma empty_contradiction (q n m K : ℕ) (S : Fin m → Finset (Fin n))
+    (hq : 2 ≤ q) (hcardS : ∀ i : Fin m, (S i).card = q + 1)
+    (gates : List Gate) (w : Fin m) (c : ℕ) (hcq : c ≤ q) (hcK : c * q < K)
+    (hspec : (spec gates S w).card < c)
+    (P : Finset (Fin n)) (A : Finset (Fin gates.length)) (d : ℕ)
+    (hgs : GoodState n K q S gates w 0 ∅ P A d) : False := by
+  rcases hgs with ⟨_, _, hFalse, hAsub, hCard, _, hHit, hSize⟩
+  have hd_le_c : d ≤ c := by
+    have h1 := Finset.card_le_card hAsub
+    simp only [Finset.card_empty, Nat.zero_add] at hCard
+    omega
+  have hP_le_K : P.card ≤ K := by
+    rcases hSize with hPd | ⟨hPdq, _⟩
+    · have h1 : d ≤ d * q := Nat.le_mul_of_pos_right d (by omega)
+      have h2 : d * q ≤ c * q := Nat.mul_le_mul_right q hd_le_c
+      omega
+    · have h2 : d * q ≤ c * q := Nat.mul_le_mul_right q hd_le_c
+      omega
+  have hex : ∃ v ∈ S w, ind P v = false := by
+    by_contra hno
+    push Not at hno
+    have hsub : S w ⊆ P := by
       intro v hv
-      rcases hA v (Finset.mem_erase.mp hv).2 with hs | ⟨j,hj⟩
-      · exact (Finset.card_le_card Finset.sdiff_subset).trans hs
-      · rw [hj]
-        by_cases h : j = i
-        · simp [h]
-        · have he := Finset.card_sdiff_add_card_inter (S j) (S i)
-          rw [hinter j i h, hsize] at he
-          omega
-    have hsub : B.biUnion A ⊆ S i ∪ R.biUnion (fun v => A v \ S i) := by
-      intro p hp
-      obtain ⟨v,hv,hp⟩ := Finset.mem_biUnion.mp hp
-      by_cases h : p ∈ S i
-      · exact Finset.mem_union_left _ h
-      · have hne : v ≠ w := by rintro rfl; exact h (hi ▸ hp)
-        exact Finset.mem_union_right _ (Finset.mem_biUnion.mpr
-          ⟨v,Finset.mem_erase.mpr ⟨hne,hv⟩,Finset.mem_sdiff.mpr ⟨hp,h⟩⟩)
-    have h1 := Finset.card_le_card hsub
-    have h2 := Finset.card_union_le (S i) (R.biUnion (fun v => A v \ S i))
-    have h3 := Finset.card_biUnion_le_card_mul R (fun v => A v \ S i) q hdiff
-    have he : R.card + 1 = B.card := Finset.card_erase_add_one hw
-    rw [← he, Nat.add_mul, Nat.one_mul]
-    rw [hsize] at h2
+      have hv' := hno v hv
+      simp [ind] at hv'
+      exact hv'
+    have hinter_eq : P ∩ S w = S w := Finset.inter_eq_right.mpr hsub
+    have hcard_eq : (P ∩ S w).card = q + 1 := by
+      rw [hinter_eq, hcardS w]
     omega
-  · have hsmall (v) (hv : v ∈ B) : (A v).card ≤ q :=
-      (hA v hv).resolve_right (fun h => hbig ⟨v,hv,h⟩)
-    exact (Finset.card_biUnion_le_card_mul B A q hsmall).trans (by omega)
-
-private def specific {n m : ℕ} (C : Circuit) (S : Fin m → Finset (Fin n)) (i : Fin m) :
-    Finset ℕ := (Finset.Ico n (n+C.size)).filter fun w =>
-      value C (onSet (S i)) w = true ∧ ∀ j, j ≠ i → value C (onSet (S j)) w = false
-
-private lemma private_count {q n m K : ℕ} (S : Fin m → Finset (Fin n))
-    (hq : 2 ≤ q) (hsize : ∀ i, (S i).card = q+1)
-    (hinter : ∀ i j, i ≠ j → (S i ∩ S j).card = 1)
-    (C : Circuit) (i : Fin m) (o c : ℕ)
-    (hg : ∀ g ∈ C.gates, (g.op = GateOp.and ∨ g.op = GateOp.or) ∧ g.inputs.length ≤ 2)
-    (heval : ∀ T : Finset (Fin n), T.card ≤ K →
-      (value C (onSet T) o = true ↔ S i ⊆ T))
-    (hc : c ≤ q) (hK : c*q < K) : c ≤ (specific C S i).card := by
-  classical
-  by_contra! hsmall
-  let G := specific C S i
-  have hgate : ∀ w ∈ G, n ≤ w ∧ w < n + C.size := by
-    intro w hw
-    exact Finset.mem_Ico.mp (Finset.mem_filter.mp hw).1
-  obtain ⟨B, hd, hBC, hcut⟩ := cut C hg G hgate (n+C.size) {o} (fun w _ hw => (hgate w hw).2)
-  have hb : B.card ≤ c := by
-    have hf := Finset.card_filter_le G (fun w => w < n+C.size)
-    simp only [Finset.card_singleton] at hBC
-    change G.card < c at hsmall
-    omega
-  have hpositive : 1 ≤ c := by omega
-  have hsK : (S i).card ≤ K := by
-    have hp := Nat.mul_le_mul_right q hpositive
-    rw [Nat.one_mul] at hp
-    rw [hsize]
-    omega
-  have witness (w : ℕ) (hw : w ∈ B) : ∃ T : Finset (Fin n),
-      (T.card ≤ q ∨ ∃ j, T = S j) ∧ (T ∩ S i).card ≤ 1 ∧
-      (value C (onSet (S i)) w = true → value C (onSet T) w = true) := by
-    by_cases hv : value C (onSet (S i)) w = true
-    · by_cases hin : w < n
-      · let p : Fin n := ⟨w,hin⟩
-        refine ⟨{p},Or.inl (by simp; omega),?_,?_⟩
-        · exact (Finset.card_le_card (Finset.inter_subset_left : {p} ∩ S i ⊆ {p})).trans (by simp)
-        · intro _
-          change value C (onSet {p}) p = true
-          simp [input_value,onSet]
-      · have bound : w < n+C.size := by
-          by_contra! he
-          simp [missing_value C _ w he] at hv
-        have hn : w ∉ specific C S i := Finset.disjoint_left.mp hd hw
-        have hex : ∃ j, j ≠ i ∧ value C (onSet (S j)) w = true := by
-          by_contra! neg
-          apply hn
-          refine Finset.mem_filter.mpr ⟨Finset.mem_Ico.mpr ⟨by omega,bound⟩,hv,?_⟩
-          intro j hj
-          simpa using neg j hj
-        obtain ⟨j,hji,hj⟩ := hex
-        exact ⟨S j,Or.inr ⟨j,rfl⟩,(hinter j i hji).le,fun _ => hj⟩
-    · exact ⟨∅,Or.inl (by simp),by simp,fun ht => False.elim (hv ht)⟩
-  let A (w : ℕ) : Finset (Fin n) := if h : w ∈ B then (witness w h).choose else ∅
-  have ha (w : ℕ) (hw : w ∈ B) :
-      ((A w).card ≤ q ∨ ∃ j, A w = S j) ∧ (A w ∩ S i).card ≤ 1 ∧
-      (value C (onSet (S i)) w = true → value C (onSet (A w)) w = true) := by
-    simpa [A,hw] using (witness w hw).choose_spec
-  let U := B.biUnion A
-  have hu : U.card ≤ K := by
-    have h := union_bound S hsize hinter B A (fun w hw => (ha w hw).1)
-    have h' := Nat.mul_le_mul_right q hb
-    change (B.biUnion A).card ≤ K
-    omega
-  have hot : value C (onSet U) o = true := by
-    apply hcut (onSet (S i)) (onSet U) _ o (Finset.mem_singleton_self o)
-      ((heval (S i) hsK).mpr (by rfl))
-    intro w hw hp
-    apply value_mono C hg (onSet (A w)) (onSet U) _ w ((ha w hw).2.2 hp)
+  have hw_le : (Finset.univ.filter (fun i : Fin n => ind P i = true)).card ≤ K := by
+    rw [weight_ind]
+    exact hP_le_K
+  have hp_all : ∀ p ∈ P, ind P p = true := by
     intro p hp
-    exact decide_eq_true (Finset.mem_biUnion.mpr ⟨w,hw,of_decide_eq_true hp⟩)
-  have hSub := (heval U hu).mp hot
-  have hcover : S i ⊆ B.biUnion (fun w => A w ∩ S i) := by
-    intro p hp
-    obtain ⟨w,hw,hm⟩ := Finset.mem_biUnion.mp (hSub hp)
-    exact Finset.mem_biUnion.mpr ⟨w,hw,Finset.mem_inter.mpr ⟨hm,hp⟩⟩
-  have h1 := Finset.card_le_card hcover
-  have h2 := Finset.card_biUnion_le_card_mul B (fun w => A w ∩ S i) 1 (fun w hw => (ha w hw).2.1)
-  rw [hsize] at h1
-  simp only [Nat.mul_one] at h2
-  omega
+    simp [ind, hp]
+  obtain ⟨u, hu, _⟩ := hFalse (ind P) hw_le hp_all hex
+  simp at hu
+
+lemma descent_contradiction (q n m K : ℕ) (S : Fin m → Finset (Fin n))
+    (hq : 2 ≤ q) (hcardS : ∀ i : Fin m, (S i).card = q + 1)
+    (hinter : ∀ i j : Fin m, i ≠ j → (S i ∩ S j).card = 1)
+    (gates : List Gate)
+    (hgates : ∀ g ∈ gates, (g.op = GateOp.and ∨ g.op = GateOp.or) ∧ g.inputs.length ≤ 2)
+    (w : Fin m) (c : ℕ) (hcq : c ≤ q) (hcK : c * q < K)
+    (hspec : (spec gates S w).card < c) :
+    ∀ B F P A d, GoodState n K q S gates w B F P A d → False := by
+  intro B
+  induction B using Nat.strong_induction_on with
+  | ind B ih =>
+    intro F P A d hgs
+    by_cases hF : F.Nonempty
+    · let u := F.max' hF
+      have huF : u ∈ F := F.max'_mem hF
+      have huB : u < B := hgs.1 u huF
+      have hu_true : wireAt gates n (ind (S w)) u = true := hgs.2.1 u huF
+      have hu_lt_len : u < n + gates.length := wireAt_lt_length gates n (ind (S w)) hu_true
+      have hErLt : ∀ y ∈ F.erase u, y < u := by
+        intro y hy
+        rw [Finset.mem_erase] at hy
+        exact lt_of_le_of_ne (F.le_max' y hy.2) hy.1
+      rcases hgs with ⟨_, hTrue, hFalse, hAsub, hCard, hOrder, hHit, hSize⟩
+      have hgs_op : ∀ g ∈ gates, g.op = GateOp.and ∨ g.op = GateOp.or :=
+        fun g hg => (hgates g hg).1
+      by_cases hun : u < n
+      · let i : Fin n := ⟨u, hun⟩
+        have hwi : ∀ x : Fin n → Bool, wireAt gates n x u = x i :=
+          fun x => wireAt_input gates n x hun
+        have hiSw : i ∈ S w := by
+          have h1 := hu_true
+          rw [hwi (ind (S w))] at h1
+          simpa [ind] using h1
+        by_cases hiP : i ∈ P
+        · refine ih u huB (F.erase u) P A d ⟨hErLt, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+          · intro y hy
+            exact hTrue y (Finset.erase_subset u F hy)
+          · intro x hxK hxP hxSw
+            obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+            refine ⟨f, Finset.mem_erase.mpr ⟨?_, hfF⟩, hfx⟩
+            intro hfu
+            rw [hfu, hwi x, hxP i hiP] at hfx
+            exact Bool.false_ne_true hfx.symm
+          · have hle : (F.erase u).card ≤ F.card := Finset.card_erase_le
+            omega
+          · intro y hy j hj
+            exact hOrder y (Finset.erase_subset u F hy) j hj
+        · refine ih u huB (F.erase u) (insert i P) A (d + 1)
+            ⟨hErLt, ?_, ?_, hAsub, ?_, ?_, ?_, ?_⟩
+          · intro y hy
+            exact hTrue y (Finset.erase_subset u F hy)
+          · intro x hxK hxP hxSw
+            have hxP' : ∀ p ∈ P, x p = true :=
+              fun p hp => hxP p (Finset.mem_insert_of_mem hp)
+            obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP' hxSw
+            refine ⟨f, Finset.mem_erase.mpr ⟨?_, hfF⟩, hfx⟩
+            intro hfu
+            rw [hfu, hwi x, hxP i (Finset.mem_insert_self i P)] at hfx
+            exact Bool.false_ne_true hfx.symm
+          · have h1 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+            omega
+          · intro y hy j hj
+            exact hOrder y (Finset.erase_subset u F hy) j hj
+          · have hsub : insert i P ∩ S w ⊆ insert i (P ∩ S w) := by
+              intro z hz
+              simp only [Finset.mem_inter, Finset.mem_insert] at hz ⊢
+              rcases hz.1 with rfl | hzP
+              · exact Or.inl rfl
+              · exact Or.inr ⟨hzP, hz.2⟩
+            have h1 := Finset.card_le_card hsub
+            have h2 := Finset.card_insert_le i (P ∩ S w)
+            omega
+          · rcases hSize with hPd | ⟨hPdq, v₀, hv₀⟩
+            · left
+              have h1 := Finset.card_insert_le i P
+              omega
+            · right
+              refine ⟨?_, v₀, hv₀.trans (Finset.subset_insert i P)⟩
+              have h1 := Finset.card_insert_le i P
+              have h2 : (d + 1) * q + 1 = d * q + q + 1 := by ring
+              omega
+      · have hnu : n ≤ u := Nat.le_of_not_lt hun
+        let j : Fin gates.length := ⟨u - n, by omega⟩
+        have huj : u = n + j.1 := (Nat.add_sub_cancel' hnu).symm
+        by_cases hspec_j : ∀ v : Fin m, v ≠ w → wireAt gates n (ind (S v)) u = false
+        · have hj_spec : j ∈ spec gates S w := by
+            simp only [spec, Finset.mem_filter, Finset.mem_univ, true_and]
+            exact ⟨huj ▸ hu_true, fun v hv => huj ▸ hspec_j v hv⟩
+          have hj_not_A : j ∉ A := by
+            intro hjA
+            have hlt := hOrder u huF j hjA
+            rw [huj] at hlt
+            exact absurd hlt (Nat.lt_irrefl _)
+          let g := gates[j.1]
+          have hg_mem : g ∈ gates := List.getElem_mem j.2
+          have hg := hgates g hg_mem
+          have hgate_eval : ∀ x : Fin n → Bool,
+              wireAt gates n x u =
+                g.op.eval (g.inputs.map fun a => if a < u then wireAt gates n x a else false) := by
+            intro x
+            rw [huj]
+            exact wireAt_gate gates n x j.2
+          rcases hg.1 with hop | hop
+          · rcases hinputs : g.inputs with _ | ⟨a, _ | ⟨b, _ | _⟩⟩
+            · refine ih u huB (F.erase u) P A d ⟨hErLt, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+              · intro y hy
+                exact hTrue y (Finset.erase_subset u F hy)
+              · intro x hxK hxP hxSw
+                obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                refine ⟨f, Finset.mem_erase.mpr ⟨?_, hfF⟩, hfx⟩
+                intro hfu
+                have htrue : wireAt gates n x u = true := by
+                  rw [hgate_eval x, hop, hinputs]
+                  rfl
+                rw [hfu, htrue] at hfx
+                exact Bool.false_ne_true hfx.symm
+              · have hle : (F.erase u).card ≤ F.card := Finset.card_erase_le
+                omega
+              · intro y hy k hk
+                exact hOrder y (Finset.erase_subset u F hy) k hk
+            · have ha_eval : ∀ x : Fin n → Bool,
+                  wireAt gates n x u = if a < u then wireAt gates n x a else false := by
+                intro x
+                rw [hgate_eval x, hop, hinputs]
+                simp [GateOp.eval]
+              have ha_lt : a < u := by
+                have h1 := ha_eval (ind (S w))
+                rw [hu_true] at h1
+                by_contra hno
+                simp only [hno, ↓reduceIte] at h1
+                exact Bool.false_ne_true h1.symm
+              have ha_true : wireAt gates n (ind (S w)) a = true := by
+                have h1 := ha_eval (ind (S w))
+                simp only [hu_true, ha_lt, ↓reduceIte] at h1
+                exact h1.symm
+              refine ih u huB (insert a (F.erase u)) P A d
+                ⟨?_, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+              · intro y hy
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact ha_lt
+                · exact hErLt y hy
+              · intro y hy
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact ha_true
+                · exact hTrue y (Finset.erase_subset u F hy)
+              · intro x hxK hxP hxSw
+                obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                by_cases hfu : f = u
+                · subst hfu
+                  refine ⟨a, Finset.mem_insert_self a _, ?_⟩
+                  have h1 := ha_eval x
+                  simp only [ha_lt, ↓reduceIte] at h1
+                  rw [← h1, hfx]
+                · exact ⟨f, Finset.mem_insert_of_mem (Finset.mem_erase.mpr ⟨hfu, hfF⟩), hfx⟩
+              · have h1 : (insert a (F.erase u)).card ≤ (F.erase u).card + 1 :=
+                  Finset.card_insert_le a (F.erase u)
+                have h2 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+                omega
+              · intro y hy k hk
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact lt_trans ha_lt (hOrder u huF k hk)
+                · exact hOrder y (Finset.erase_subset u F hy) k hk
+            · have hab_eval : ∀ x : Fin n → Bool,
+                  wireAt gates n x u =
+                    ((if a < u then wireAt gates n x a else false) &&
+                      (if b < u then wireAt gates n x b else false)) := by
+                intro x
+                rw [hgate_eval x, hop, hinputs]
+                simp [GateOp.eval]
+              have hab_w := hab_eval (ind (S w))
+              rw [hu_true] at hab_w
+              have ha_branch : (if a < u then wireAt gates n (ind (S w)) a else false) = true := by
+                exact Bool.and_elim_left hab_w.symm
+              have hb_branch : (if b < u then wireAt gates n (ind (S w)) b else false) = true := by
+                exact Bool.and_elim_right hab_w.symm
+              have ha_lt : a < u := by
+                by_contra hno
+                simp only [hno, ↓reduceIte] at ha_branch
+                exact Bool.false_ne_true ha_branch
+              have hb_lt : b < u := by
+                by_contra hno
+                simp only [hno, ↓reduceIte] at hb_branch
+                exact Bool.false_ne_true hb_branch
+              have ha_true : wireAt gates n (ind (S w)) a = true := by
+                simp only [ha_lt, ↓reduceIte] at ha_branch
+                exact ha_branch
+              have hb_true : wireAt gates n (ind (S w)) b = true := by
+                simp only [hb_lt, ↓reduceIte] at hb_branch
+                exact hb_branch
+              refine ih u huB (insert a (insert b (F.erase u))) P (insert j A) d
+                ⟨?_, ?_, ?_, ?_, ?_, ?_, hHit, hSize⟩
+              · intro y hy
+                simp only [Finset.mem_insert] at hy
+                rcases hy with rfl | rfl | hy
+                · exact ha_lt
+                · exact hb_lt
+                · exact hErLt y hy
+              · intro y hy
+                simp only [Finset.mem_insert] at hy
+                rcases hy with rfl | rfl | hy
+                · exact ha_true
+                · exact hb_true
+                · exact hTrue y (Finset.erase_subset u F hy)
+              · intro x hxK hxP hxSw
+                obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                by_cases hfu : f = u
+                · subst hfu
+                  have h1 := hab_eval x
+                  simp only [ha_lt, hb_lt, ↓reduceIte, hfx] at h1
+                  have h2 : wireAt gates n x a = false ∨ wireAt gates n x b = false := by
+                    cases hwa : wireAt gates n x a
+                    · exact Or.inl rfl
+                    · cases hwb : wireAt gates n x b
+                      · exact Or.inr rfl
+                      · simp [hwa, hwb] at h1
+                  rcases h2 with hwa | hwb
+                  · exact ⟨a, Finset.mem_insert_self a _, hwa⟩
+                  · exact ⟨b, Finset.mem_insert_of_mem (Finset.mem_insert_self b _), hwb⟩
+                · exact ⟨f, Finset.mem_insert_of_mem
+                    (Finset.mem_insert_of_mem (Finset.mem_erase.mpr ⟨hfu, hfF⟩)), hfx⟩
+              · exact Finset.insert_subset_iff.mpr ⟨hj_spec, hAsub⟩
+              · have h1 : (insert a (insert b (F.erase u))).card ≤ (insert b (F.erase u)).card + 1 :=
+                  Finset.card_insert_le _ _
+                have h2 : (insert b (F.erase u)).card ≤ (F.erase u).card + 1 :=
+                  Finset.card_insert_le _ _
+                have h3 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+                have h4 : (insert j A).card = A.card + 1 := Finset.card_insert_of_notMem hj_not_A
+                omega
+              · intro y hy k hk
+                rw [Finset.mem_insert] at hk
+                have hyu : y < u := by
+                  simp only [Finset.mem_insert] at hy
+                  rcases hy with rfl | rfl | hy
+                  · exact ha_lt
+                  · exact hb_lt
+                  · exact hErLt y hy
+                rcases hk with rfl | hkA
+                · omega
+                · exact lt_trans hyu (hOrder u huF k hkA)
+            · have hlen := hg.2
+              rw [hinputs] at hlen
+              simp at hlen
+          · rcases hinputs : g.inputs with _ | ⟨a, _ | ⟨b, _ | _⟩⟩
+            · exfalso
+              have h1 := hgate_eval (ind (S w))
+              rw [hu_true, hop, hinputs] at h1
+              simp [GateOp.eval] at h1
+            · have ha_eval : ∀ x : Fin n → Bool,
+                  wireAt gates n x u = if a < u then wireAt gates n x a else false := by
+                intro x
+                rw [hgate_eval x, hop, hinputs]
+                simp [GateOp.eval]
+              have ha_lt : a < u := by
+                have h1 := ha_eval (ind (S w))
+                rw [hu_true] at h1
+                by_contra hno
+                simp only [hno, ↓reduceIte] at h1
+                exact Bool.false_ne_true h1.symm
+              have ha_true : wireAt gates n (ind (S w)) a = true := by
+                have h1 := ha_eval (ind (S w))
+                simp only [hu_true, ha_lt, ↓reduceIte] at h1
+                exact h1.symm
+              refine ih u huB (insert a (F.erase u)) P A d
+                ⟨?_, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+              · intro y hy
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact ha_lt
+                · exact hErLt y hy
+              · intro y hy
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact ha_true
+                · exact hTrue y (Finset.erase_subset u F hy)
+              · intro x hxK hxP hxSw
+                obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                by_cases hfu : f = u
+                · subst hfu
+                  refine ⟨a, Finset.mem_insert_self a _, ?_⟩
+                  have h1 := ha_eval x
+                  simp only [ha_lt, ↓reduceIte] at h1
+                  rw [← h1, hfx]
+                · exact ⟨f, Finset.mem_insert_of_mem (Finset.mem_erase.mpr ⟨hfu, hfF⟩), hfx⟩
+              · have h1 : (insert a (F.erase u)).card ≤ (F.erase u).card + 1 :=
+                  Finset.card_insert_le a (F.erase u)
+                have h2 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+                omega
+              · intro y hy k hk
+                rw [Finset.mem_insert] at hy
+                rcases hy with rfl | hy
+                · exact lt_trans ha_lt (hOrder u huF k hk)
+                · exact hOrder y (Finset.erase_subset u F hy) k hk
+            · have hab_eval : ∀ x : Fin n → Bool,
+                  wireAt gates n x u =
+                    ((if a < u then wireAt gates n x a else false) ||
+                      (if b < u then wireAt gates n x b else false)) := by
+                intro x
+                rw [hgate_eval x, hop, hinputs]
+                simp [GateOp.eval]
+              have hab_w := hab_eval (ind (S w))
+              rw [hu_true] at hab_w
+              have hbranch : (if a < u then wireAt gates n (ind (S w)) a else false) = true ∨
+                  (if b < u then wireAt gates n (ind (S w)) b else false) = true := by
+                cases h1 : (if a < u then wireAt gates n (ind (S w)) a else false) <;>
+                  cases h2 : (if b < u then wireAt gates n (ind (S w)) b else false) <;>
+                  simp [h1, h2] at hab_w ⊢
+              rcases hbranch with ha_branch | hb_branch
+              · have ha_lt : a < u := by
+                  by_contra hno
+                  simp only [hno, ↓reduceIte] at ha_branch
+                  exact Bool.false_ne_true ha_branch
+                have ha_true : wireAt gates n (ind (S w)) a = true := by
+                  simp only [ha_lt, ↓reduceIte] at ha_branch
+                  exact ha_branch
+                refine ih u huB (insert a (F.erase u)) P A d
+                  ⟨?_, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+                · intro y hy
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact ha_lt
+                  · exact hErLt y hy
+                · intro y hy
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact ha_true
+                  · exact hTrue y (Finset.erase_subset u F hy)
+                · intro x hxK hxP hxSw
+                  obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                  by_cases hfu : f = u
+                  · subst hfu
+                    refine ⟨a, Finset.mem_insert_self a _, ?_⟩
+                    have h1 := hab_eval x
+                    simp only [ha_lt, ↓reduceIte, hfx] at h1
+                    cases hwa : wireAt gates n x a
+                    · rfl
+                    · simp [hwa] at h1
+                  · exact ⟨f, Finset.mem_insert_of_mem (Finset.mem_erase.mpr ⟨hfu, hfF⟩), hfx⟩
+                · have h1 : (insert a (F.erase u)).card ≤ (F.erase u).card + 1 :=
+                    Finset.card_insert_le a (F.erase u)
+                  have h2 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+                  omega
+                · intro y hy k hk
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact lt_trans ha_lt (hOrder u huF k hk)
+                  · exact hOrder y (Finset.erase_subset u F hy) k hk
+              · have hb_lt : b < u := by
+                  by_contra hno
+                  simp only [hno, ↓reduceIte] at hb_branch
+                  exact Bool.false_ne_true hb_branch
+                have hb_true : wireAt gates n (ind (S w)) b = true := by
+                  simp only [hb_lt, ↓reduceIte] at hb_branch
+                  exact hb_branch
+                refine ih u huB (insert b (F.erase u)) P A d
+                  ⟨?_, ?_, ?_, hAsub, ?_, ?_, hHit, hSize⟩
+                · intro y hy
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact hb_lt
+                  · exact hErLt y hy
+                · intro y hy
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact hb_true
+                  · exact hTrue y (Finset.erase_subset u F hy)
+                · intro x hxK hxP hxSw
+                  obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP hxSw
+                  by_cases hfu : f = u
+                  · subst hfu
+                    refine ⟨b, Finset.mem_insert_self b _, ?_⟩
+                    have h1 := hab_eval x
+                    simp only [hb_lt, ↓reduceIte, hfx] at h1
+                    cases hwb : wireAt gates n x b
+                    · rfl
+                    · simp [hwb] at h1
+                  · exact ⟨f, Finset.mem_insert_of_mem (Finset.mem_erase.mpr ⟨hfu, hfF⟩), hfx⟩
+                · have h1 : (insert b (F.erase u)).card ≤ (F.erase u).card + 1 :=
+                    Finset.card_insert_le b (F.erase u)
+                  have h2 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+                  omega
+                · intro y hy k hk
+                  rw [Finset.mem_insert] at hy
+                  rcases hy with rfl | hy
+                  · exact lt_trans hb_lt (hOrder u huF k hk)
+                  · exact hOrder y (Finset.erase_subset u F hy) k hk
+            · have hlen := hg.2
+              rw [hinputs] at hlen
+              simp at hlen
+        · push Not at hspec_j
+          obtain ⟨v, hvw, hv_true_neq⟩ := hspec_j
+          have hv_true : wireAt gates n (ind (S v)) u = true := by
+            cases hval : wireAt gates n (ind (S v)) u
+            · exact False.elim (hv_true_neq hval)
+            · rfl
+          refine ih u huB (F.erase u) (P ∪ S v) A (d + 1)
+            ⟨hErLt, ?_, ?_, hAsub, ?_, ?_, ?_, ?_⟩
+          · intro y hy
+            exact hTrue y (Finset.erase_subset u F hy)
+          · intro x hxK hxP hxSw
+            have hxP' : ∀ p ∈ P, x p = true :=
+              fun p hp => hxP p (Finset.mem_union_left (S v) hp)
+            obtain ⟨f, hfF, hfx⟩ := hFalse x hxK hxP' hxSw
+            refine ⟨f, Finset.mem_erase.mpr ⟨?_, hfF⟩, hfx⟩
+            intro hfu
+            have hmono : wireAt gates n x u = true := by
+              refine wireAt_mono gates hgs_op n (ind (S v)) x ?_ u hv_true
+              intro p hp
+              simp only [ind, decide_eq_true_eq] at hp
+              exact hxP p (Finset.mem_union_right P hp)
+            rw [hfu, hmono] at hfx
+            exact Bool.false_ne_true hfx.symm
+          · have h1 : (F.erase u).card + 1 = F.card := Finset.card_erase_add_one huF
+            omega
+          · intro y hy k hk
+            exact hOrder y (Finset.erase_subset u F hy) k hk
+          · have hinter_eq : (P ∪ S v) ∩ S w = (P ∩ S w) ∪ (S v ∩ S w) :=
+              Finset.union_inter_distrib_right P (S v) (S w)
+            rw [hinter_eq]
+            have h1 := Finset.card_union_le (P ∩ S w) (S v ∩ S w)
+            have h2 := hinter v w hvw
+            omega
+          · right
+            refine ⟨?_, v, Finset.subset_union_right⟩
+            rcases hSize with hPd | ⟨hPdq, v₀, hv₀⟩
+            · have h1 := Finset.card_union_le P (S v)
+              have hSv := hcardS v
+              have hdq : d ≤ d * q := Nat.le_mul_of_pos_right d (by omega)
+              have hmul : (d + 1) * q + 1 = d * q + q + 1 := by ring
+              omega
+            · have hle_inter : 1 ≤ (P ∩ S v).card := by
+                have hsub : S v ∩ S v₀ ⊆ P ∩ S v := by
+                  intro z hz
+                  rw [Finset.mem_inter] at hz ⊢
+                  exact ⟨hv₀ hz.2, hz.1⟩
+                have hcard_ge : 1 ≤ (S v ∩ S v₀).card := by
+                  by_cases hvv₀ : v = v₀
+                  · subst hvv₀
+                    rw [Finset.inter_self, hcardS v]
+                    omega
+                  · rw [hinter v v₀ hvv₀]
+                exact le_trans hcard_ge (Finset.card_le_card hsub)
+              have hunion := Finset.card_union_add_card_inter P (S v)
+              have hSv := hcardS v
+              have hmul : (d + 1) * q + 1 = d * q + q + 1 := by ring
+              omega
+    · rw [Finset.not_nonempty_iff_eq_empty] at hF
+      subst hF
+      have h0 : GoodState n K q S gates w 0 ∅ P A d := by
+        refine ⟨?_, hgs.2.1, hgs.2.2.1, hgs.2.2.2.1, hgs.2.2.2.2.1, hgs.2.2.2.2.2.1,
+          hgs.2.2.2.2.2.2.1, hgs.2.2.2.2.2.2.2⟩
+        intro u hu
+        simp at hu
+      exact empty_contradiction q n m K S hq hcardS gates w c hcq hcK hspec P A d h0
+
+lemma main :
+    ∀ (q n m K : ℕ) (S : Fin m → Finset (Fin n)),
+      2 ≤ q →
+      (∀ i : Fin m, (S i).card = q + 1) →
+      (∀ i j : Fin m, i ≠ j → (S i ∩ S j).card = 1) →
+      ∀ (gates : List PEqualNP.CircuitLowerBounds.Gate) (out : Fin m → ℕ),
+        (∀ g ∈ gates,
+          (g.op = PEqualNP.CircuitLowerBounds.GateOp.and ∨
+            g.op = PEqualNP.CircuitLowerBounds.GateOp.or) ∧ g.inputs.length ≤ 2) →
+        (∀ (w : Fin m) (x : Fin n → Bool),
+          (Finset.univ.filter (fun i : Fin n => x i = true)).card ≤ K →
+          PEqualNP.CircuitLowerBounds.Circuit.eval ⟨gates, out w⟩ (List.ofFn x) =
+            decide (∀ v ∈ S w, x v = true)) →
+        ∀ c : ℕ, c ≤ q → c * q < K → m * c ≤ gates.length := by
+  intro q n m K S hq hcardS hinter gates out hgates heval c hcq hcK
+  by_cases hc0 : c = 0
+  · subst hc0
+    simp
+  have hcpos : 1 ≤ c := Nat.pos_of_ne_zero hc0
+  have hspec_ge : ∀ w : Fin m, c ≤ (spec gates S w).card := by
+    intro w
+    by_contra hlt
+    have hspec : (spec gates S w).card < c := Nat.lt_of_not_le hlt
+    refine descent_contradiction q n m K S hq hcardS hinter gates hgates w c hcq hcK hspec
+      (out w + 1) {out w} ∅ ∅ 0 ?_
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    · intro u hu
+      rw [Finset.mem_singleton] at hu
+      omega
+    · intro u hu
+      rw [Finset.mem_singleton] at hu
+      subst hu
+      rw [← wireAt_eq_eval]
+      have hwK : (Finset.univ.filter (fun i : Fin n => ind (S w) i = true)).card ≤ K := by
+        rw [weight_ind, hcardS w]
+        have h1 : 1 * q ≤ c * q := Nat.mul_le_mul_right q hcpos
+        omega
+      rw [heval w (ind (S w)) hwK]
+      simp [ind]
+    · intro x hxK hxP hxSw
+      refine ⟨out w, Finset.mem_singleton_self _, ?_⟩
+      rw [← wireAt_eq_eval, heval w x hxK]
+      obtain ⟨v, hv, hxv⟩ := hxSw
+      simp only [decide_eq_false_iff_not, not_forall]
+      exact ⟨v, hv, by simp [hxv]⟩
+    · exact Finset.empty_subset _
+    · simp
+    · intro u hu j hj
+      simp at hj
+    · simp
+    · left
+      simp
+  have hdisj : Set.PairwiseDisjoint (↑(Finset.univ : Finset (Fin m))) (spec gates S) := by
+    intro w₁ _ w₂ _ hw
+    exact spec_disjoint gates S hw
+  have hsum : (∑ w : Fin m, (spec gates S w).card) ≤ gates.length := by
+    rw [← Finset.card_biUnion hdisj]
+    calc ((Finset.univ : Finset (Fin m)).biUnion (spec gates S)).card
+        ≤ (Finset.univ : Finset (Fin gates.length)).card := Finset.card_le_univ _
+      _ = gates.length := Finset.card_fin gates.length
+  calc m * c = ∑ _w : Fin m, c := by simp [Finset.sum_const]
+    _ ≤ ∑ w : Fin m, (spec gates S w).card := Finset.sum_le_sum fun w _ => hspec_ge w
+    _ ≤ gates.length := hsum
 
 end PEqualNP.Outside.L_meta_925
 
-open PEqualNP.Outside.L_meta_925 in
-theorem PEqualNP.Outside.L_meta_925 : ∀ (q n m K : ℕ) (S : Fin m → Finset (Fin n)), 2 ≤ q → (∀ i : Fin m, (S i).card = q + 1) → (∀ i j : Fin m, i ≠ j → (S i ∩ S j).card = 1) → ∀ (gates : List PEqualNP.CircuitLowerBounds.Gate) (out : Fin m → ℕ), (∀ g ∈ gates, (g.op = PEqualNP.CircuitLowerBounds.GateOp.and ∨ g.op = PEqualNP.CircuitLowerBounds.GateOp.or) ∧ g.inputs.length ≤ 2) → (∀ (w : Fin m) (x : Fin n → Bool), (Finset.univ.filter (fun i : Fin n => x i = true)).card ≤ K → PEqualNP.CircuitLowerBounds.Circuit.eval ⟨gates, out w⟩ (List.ofFn x) = decide (∀ v ∈ S w, x v = true)) → ∀ c : ℕ, c ≤ q → c * q < K → m * c ≤ gates.length := by
-  classical
-  intro q n m K S hq hsize hinter gates out hg heval c hc hK
-  let C : Circuit := ⟨gates,0⟩
-  let G (i : Fin m) := specific C S i
-  have hd : ((Finset.univ : Finset (Fin m)) : Set (Fin m)).PairwiseDisjoint G := by
-    intro i _ j _ hij
-    refine Finset.disjoint_left.mpr fun w hi hj => ?_
-    have hfalse := (Finset.mem_filter.mp hi).2.2 j (Ne.symm hij)
-    have htrue := (Finset.mem_filter.mp hj).2.1
-    simp [htrue] at hfalse
-  have hi (i : Fin m) : c ≤ (G i).card := by
-    apply private_count S hq hsize hinter C i (out i) c hg _ hc hK
-    intro T hT
-    have h := heval i (onSet T) ((weight T).symm ▸ hT)
-    change value C (onSet T) (out i) = _ at h
-    rw [h]
-    simp [onSet,Finset.subset_iff]
-  have hs : Finset.univ.biUnion G ⊆ Finset.Ico n (n+C.size) := by
-    intro w hw
-    obtain ⟨i,_,hi⟩ := Finset.mem_biUnion.mp hw
-    exact (Finset.mem_filter.mp hi).1
-  calc
-    m*c = ∑ _i : Fin m, c := by simp
-    _ ≤ ∑ i : Fin m, (G i).card := Finset.sum_le_sum (fun i _ => hi i)
-    _ = (Finset.univ.biUnion G).card := (Finset.card_biUnion hd).symm
-    _ ≤ (Finset.Ico n (n+C.size)).card := Finset.card_le_card hs
-    _ = gates.length := by simp [C,Circuit.size]
+theorem PEqualNP.Outside.L_meta_925 : ∀ (q n m K : ℕ) (S : Fin m → Finset (Fin n)), 2 ≤ q → (∀ i : Fin m, (S i).card = q + 1) → (∀ i j : Fin m, i ≠ j → (S i ∩ S j).card = 1) → ∀ (gates : List PEqualNP.CircuitLowerBounds.Gate) (out : Fin m → ℕ), (∀ g ∈ gates, (g.op = PEqualNP.CircuitLowerBounds.GateOp.and ∨ g.op = PEqualNP.CircuitLowerBounds.GateOp.or) ∧ g.inputs.length ≤ 2) → (∀ (w : Fin m) (x : Fin n → Bool), (Finset.univ.filter (fun i : Fin n => x i = true)).card ≤ K → PEqualNP.CircuitLowerBounds.Circuit.eval ⟨gates, out w⟩ (List.ofFn x) = decide (∀ v ∈ S w, x v = true)) → ∀ c : ℕ, c ≤ q → c * q < K → m * c ≤ gates.length :=
+  PEqualNP.Outside.L_meta_925.main
